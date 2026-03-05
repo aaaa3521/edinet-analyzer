@@ -15,7 +15,9 @@
 
 ### ダッシュボード概要
 
-![概要タブ](docs/screenshots/overview.png)
+![概要タブ]
+<img width="2110" height="1031" alt="image" src="https://github.com/user-attachments/assets/7165e224-a013-4ca9-895f-256c112dad29" />
+
 
 ### 競合レーダーチャート（トヨタ・ホンダ・マツダ）
 
