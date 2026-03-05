@@ -21,11 +21,15 @@
 
 ### 競合レーダーチャート（トヨタ・ホンダ・マツダ）
 
-![レーダーチャート](docs/screenshots/radar.png)
+![レーダーチャート]
+<img width="2118" height="1018" alt="image" src="https://github.com/user-attachments/assets/ce561e3e-3ca0-4948-8904-aac32acbd508" />
+
 
 ### 株価パフォーマンス比較
 
-![株価推移](docs/screenshots/stock.png)
+![株価推移]
+<img width="2109" height="1209" alt="image" src="https://github.com/user-attachments/assets/1d1d6da2-eb9c-4312-a836-21dc5b1d577a" />
+
 
 ### 収益性・安全性グラフ
 
