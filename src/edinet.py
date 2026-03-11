@@ -44,22 +44,52 @@ class EdinetClient:
         """
         証券コードから直近の有価証券報告書のdocIDを探す
         doc_type_code: 120=有価証券報告書, 130=四半期報告書
-        最大180日分さかのぼって検索する
+
+        戦略:
+        1. 有価証券報告書は決算月の約3ヶ月後に提出される
+           （例: 3月決算 → 6月提出）
+        2. 1日ずつ遡ると最大500回APIを叩くため、
+           提出件数が多い「月末前後の平日」を週単位でサンプリングする
+        3. それでも見つからなければ直近90日を日次で精査する
         """
+        # 5桁コード（EDINETは末尾0を付加）にも対応
+        code5 = securities_code.zfill(5) if len(securities_code) == 4 else securities_code
+
+        def _matches(doc: dict) -> bool:
+            sec = doc.get("secCode") or ""
+            return (
+                sec.startswith(securities_code) or sec == code5
+            ) and doc.get("docTypeCode") == doc_type_code
+
         today = date.today()
-        for days_back in range(0, 180):
+
+        # ── フェーズ1: 週単位で最大2年分をサンプリング ──
+        for weeks_back in range(0, 104):
+            target = today - timedelta(weeks=weeks_back)
+            # 平日に補正（土→金、日→月）
+            if target.weekday() == 5:
+                target -= timedelta(days=1)
+            elif target.weekday() == 6:
+                target += timedelta(days=1)
+            try:
+                docs = self.get_documents_list(target)
+            except Exception:
+                continue
+            for doc in docs:
+                if _matches(doc):
+                    return doc["docID"]
+
+        # ── フェーズ2: 直近90日を日次で精査（週サンプリングの漏れを補完）──
+        for days_back in range(0, 90):
             target = today - timedelta(days=days_back)
             try:
                 docs = self.get_documents_list(target)
             except Exception:
                 continue
             for doc in docs:
-                if (
-                    doc.get("secCode", "").startswith(securities_code)
-                    and doc.get("docTypeCode") == doc_type_code
-                    and doc.get("docInfoEditStatus") != "2"
-                ):
+                if _matches(doc):
                     return doc["docID"]
+
         return None
 
     def download_xbrl_zip(self, doc_id: str) -> Optional[bytes]:
@@ -74,24 +104,37 @@ class EdinetClient:
 
     def extract_financials_from_zip(self, zip_bytes: bytes) -> dict:
         """
-        ZIPからXBRLを解析して財務データを抽出する
+        ZIPからiXBRL/XBRLを解析して財務データを抽出する
         返り値: {label: value, ...}
         """
         results = {}
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                # XBRL ファイルを探す（jpcrp_*_ixbrl.htm または *.xbrl）
-                xbrl_files = [
-                    n for n in zf.namelist()
-                    if n.endswith(".xbrl") or "_ixbrl" in n
-                ]
-                if not xbrl_files:
-                    return results
+                names = zf.namelist()
 
-                with zf.open(xbrl_files[0]) as f:
-                    content = f.read().decode("utf-8", errors="ignore")
+                # PublicDoc 内の iXBRL(.htm) を優先、次に .xbrl
+                candidates = (
+                    [n for n in names if "PublicDoc" in n and n.endswith(".htm")]
+                    or [n for n in names if "PublicDoc" in n and n.endswith(".xbrl")]
+                    or [n for n in names if n.endswith(".htm")]
+                    or [n for n in names if n.endswith(".xbrl")]
+                )
 
-                results = _parse_xbrl_content(content)
+                if not candidates:
+                    return {"_error": "XBRLファイルが見つかりません", "_files": str(names[:10])}
+
+                key_fields = {"net_sales", "operating_income", "net_income", "total_assets", "equity"}
+                for fname in candidates:
+                    with zf.open(fname) as f:
+                        content = f.read().decode("utf-8", errors="ignore")
+                    parsed = _parse_xbrl_content(content)
+                    for k, v in parsed.items():
+                        if k not in results:
+                            results[k] = v
+                    # 全主要項目が揃ったら終了（揃わなければ全ファイルを走査）
+                    if key_fields.issubset(results.keys()):
+                        break
+
         except Exception as e:
             results["_error"] = str(e)
         return results
@@ -112,97 +155,115 @@ class EdinetClient:
         return self.extract_financials_from_zip(zip_bytes)
 
 
-# XBRL要素名と日本語ラベルのマッピング
+# XBRL要素名と内部キーのマッピング（JP-GAAP / IFRS 両対応）
 _XBRL_FIELD_MAP = {
-    # 損益計算書
-    "NetSales": "net_sales",
-    "NetSalesOfCompletedConstructionContracts": "net_sales",
-    "OperatingIncome": "operating_income",
-    "ProfitLoss": "net_income",
-    "ProfitLossAttributableToOwnersOfParent": "net_income",
-    # 貸借対照表
-    "Assets": "total_assets",
-    "Equity": "equity",
-    "NetAssets": "equity",
+    # ── 売上高 ──────────────────────────────
+    "NetSales": "net_sales",                                    # JP-GAAP
+    "NetSalesOfCompletedConstructionContracts": "net_sales",    # JP-GAAP 工事
+    "Revenue": "net_sales",                                     # IFRS
+    "RevenueIFRS": "net_sales",                                 # IFRS (旧)
+    "NetRevenue": "net_sales",
+    "OperatingRevenue": "net_sales",
+    # ── 営業利益 ─────────────────────────────
+    "OperatingIncome": "operating_income",                      # JP-GAAP
+    "OperatingProfit": "operating_income",                      # IFRS
+    "OperatingProfitLoss": "operating_income",                  # IFRS
+    "ProfitFromOperatingActivities": "operating_income",        # IFRS
+    "OperatingProfitIFRS": "operating_income",
+    # ── 純利益 ──────────────────────────────
+    "ProfitLoss": "net_income",                                 # JP-GAAP / IFRS
+    "ProfitLossAttributableToOwnersOfParent": "net_income",     # JP-GAAP 連結
+    "ProfitLossAttributableToOwnersOfParentIFRS": "net_income", # IFRS 連結
+    "NetIncomeLoss": "net_income",
+    "Profit": "net_income",                                     # IFRS 簡略
+    # ── 総資産 ──────────────────────────────
+    "Assets": "total_assets",                                   # JP-GAAP / IFRS
+    "TotalAssets": "total_assets",
+    # ── 自己資本 ─────────────────────────────
+    "Equity": "equity",                                         # IFRS
+    "NetAssets": "equity",                                      # JP-GAAP
+    "EquityAttributableToOwnersOfParent": "equity",             # IFRS 連結
+    "TotalNetAssets": "equity",
+    # ── 有利子負債 ───────────────────────────
     "InterestBearingDebt": "interest_bearing_debt",
     "BorrowingsAndBondsPayable": "interest_bearing_debt",
-    # 株式
+    "InterestBearingLiabilities": "interest_bearing_debt",
+    "BorrowingsIFRS": "interest_bearing_debt",
+    "Borrowings": "interest_bearing_debt",
+    # ── EPS / 株式数 ─────────────────────────
     "EarningsPerShare": "eps",
+    "BasicEarningsLossPerShare": "eps",
+    "BasicEarningsPerShare": "eps",
     "NumberOfSharesOutstanding": "shares_outstanding",
 }
 
 
 def _parse_xbrl_content(content: str) -> dict:
     """
-    XBRLコンテンツから財務数値を正規表現なしで抽出する
-    簡易パーサー: タグ名をキーに数値を収集する
+    iXBRL / XBRL から財務数値を抽出する
+    BeautifulSoup で HTML/XML を柔軟にパースし、
+    ix:nonFraction 要素から値を収集する
     """
-    from xml.etree import ElementTree as ET
+    from bs4 import BeautifulSoup
 
     results: dict = {}
 
-    # iXBRL（HTML埋め込み）の場合はix:nonFraction要素を探す
-    try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
-        # 不正XMLでも部分解析を試みる
-        return _fallback_parse(content)
+    # ── iXBRL (HTML埋め込み) をBeautifulSoupで解析 ──
+    soup = BeautifulSoup(content, "html.parser")
 
-    ns_map = {
-        "ix": "http://www.xbrl.org/2013/inlineXBRL",
-        "xbrli": "http://www.xbrl.org/2003/instance",
-    }
+    # ix:nonFraction / ix:nonNumeric のどちらも探す
+    elements = soup.find_all(lambda tag: tag.name and "nonfraction" in tag.name.lower())
 
-    # iXBRL形式
-    for elem in root.iter():
-        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-        if local == "nonFraction":
-            name = elem.get("name", "")
-            context = elem.get("contextRef", "")
-            scale = int(elem.get("scale", "0") or "0")
-            sign = elem.get("sign", "")
-            text = (elem.text or "").strip().replace(",", "")
-            if not text:
-                continue
-            try:
-                value = float(text) * (10 ** scale)
-                if sign == "-":
-                    value = -value
-            except ValueError:
-                continue
+    for elem in elements:
+        name = elem.get("name", "")
+        context = elem.get("contextref", "") or elem.get("contextRef", "")
+        scale_str = elem.get("scale", "0") or "0"
+        sign = elem.get("sign", "") or ""
+        decimals = elem.get("decimals", "")
 
-            short_name = name.split(":")[-1] if ":" in name else name
-            mapped = _XBRL_FIELD_MAP.get(short_name)
-            if mapped and mapped not in results:
-                # 通期コンテキストを優先
-                if "CurrentYear" in context or "Duration" in context or not results.get(mapped):
-                    results[mapped] = value
+        text = elem.get_text(strip=True).replace(",", "").replace(" ", "").replace("\u00a0", "")
+        if not text or text in ("-", "－"):
+            continue
 
-    # 通常XBRL形式
+        try:
+            scale = int(scale_str)
+            value = float(text) * (10 ** scale)
+            if sign == "-":
+                value = -value
+        except (ValueError, OverflowError):
+            continue
+
+        short_name = name.split(":")[-1] if ":" in name else name
+        mapped = _XBRL_FIELD_MAP.get(short_name)
+        if not mapped:
+            continue
+
+        # 通期・当期コンテキストを優先（連結優先）
+        is_current = any(k in context for k in ("CurrentYear", "Duration", "Consolidated"))
+        is_prior = any(k in context for k in ("Prior", "Previous"))
+
+        if mapped not in results:
+            results[mapped] = value
+        elif is_current and not is_prior:
+            results[mapped] = value
+
+    # ── iXBRL で取れなければ通常XBRLとしてフォールバック ──
     if not results:
-        for elem in root.iter():
-            local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-            mapped = _XBRL_FIELD_MAP.get(local)
-            if mapped and mapped not in results:
-                text = (elem.text or "").strip().replace(",", "")
-                try:
-                    results[mapped] = float(text)
-                except ValueError:
-                    pass
+        results = _fallback_parse_xbrl(content)
 
     return results
 
 
-def _fallback_parse(content: str) -> dict:
-    """XMLパースに失敗した場合のフォールバック: 文字列検索で数値を抽出"""
+def _fallback_parse_xbrl(content: str) -> dict:
+    """通常XBRL形式のフォールバックパーサー（正規表現）"""
     import re
 
     results: dict = {}
     for xbrl_key, mapped_key in _XBRL_FIELD_MAP.items():
         if mapped_key in results:
             continue
-        # <jp-bs:Assets ...>12345678</jp-bs:Assets> のようなパターン
-        pattern = rf'<[^>]*[:\s]{re.escape(xbrl_key)}[^>]*>([^<]+)<'
+        # <jppfs_cor:NetSales ...>1234567</jppfs_cor:NetSales> のようなパターン
+        pattern = rf'<[^>]*:{re.escape(xbrl_key)}(?:\s[^>]*)?>([0-9,.\-]+)<'
         match = re.search(pattern, content)
         if match:
             try:

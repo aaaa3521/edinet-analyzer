@@ -14,7 +14,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.edinet import EdinetClient
-from src.yahoo_finance import get_multi_stock_info, get_price_history
+from src.yahoo_finance import get_multi_stock_info, get_price_history, get_income_history
 from src.metrics import build_summary_df, radar_metrics
 
 load_dotenv()
@@ -73,6 +73,7 @@ edinet = EdinetClient(api_key=api_key)
 
 companies_data: dict[str, dict] = {}
 price_histories: dict[str, pd.DataFrame] = {}
+income_histories: dict[str, pd.DataFrame] = {}
 
 progress = st.progress(0, text="データ取得中...")
 total = len(securities_codes)
@@ -83,6 +84,7 @@ for i, code in enumerate(securities_codes):
     # Yahoo Finance
     stock_info = get_multi_stock_info([code])[code]
     price_histories[code] = get_price_history(code, period=price_period)
+    income_histories[code] = get_income_history(code)
 
     # EDINET (APIキーがある場合のみ)
     financials: dict = {}
@@ -92,6 +94,9 @@ for i, code in enumerate(securities_codes):
         if "_error" in financials:
             st.warning(f"{code}: {financials['_error']}")
             financials = {}
+        elif financials:
+            got = [k for k in financials if not k.startswith("_")]
+            st.success(f"{code}: EDINET取得成功 → {', '.join(got)}")
     else:
         st.warning(f"{code}: EDINETキー未設定のためYahoo Financeデータのみ使用します")
 
@@ -129,8 +134,8 @@ def download_png_button(fig: go.Figure, filename: str, key: str):
 # ──────────────────────────────────────────────
 # タブ構成
 # ──────────────────────────────────────────────
-tab_overview, tab_profit, tab_safety, tab_valuation, tab_stock, tab_radar, tab_export = st.tabs(
-    ["概要", "収益性", "安全性", "バリュエーション", "株価推移", "レーダー比較", "エクスポート"]
+tab_overview, tab_trend, tab_profit, tab_safety, tab_valuation, tab_stock, tab_radar, tab_export = st.tabs(
+    ["概要", "業績推移", "収益性", "安全性", "バリュエーション", "株価推移", "レーダー比較", "エクスポート"]
 )
 
 # ========== 概要タブ ==========
@@ -167,6 +172,163 @@ with tab_overview:
         )
         st.plotly_chart(fig_mc, use_container_width=True)
         download_png_button(fig_mc, "market_cap.png", "dl_mc")
+
+# ========== 業績推移タブ ==========
+with tab_trend:
+    st.subheader("業績推移（年次・最大4期）")
+    st.caption("出典: Yahoo Finance　※経常利益は税引前利益で近似")
+
+    METRICS = ["売上高", "営業利益", "税引前利益(経常利益近似)", "当期純利益"]
+    UNIT = 1_000_000  # 百万円単位で表示
+
+    # ── 各社の個別テーブル ──
+    for code, df_inc in income_histories.items():
+        name = companies_data[code]["stock_info"].get("company_name", code)
+        st.markdown(f"#### {name}（{code}）")
+        if df_inc.empty:
+            st.warning("データを取得できませんでした")
+            continue
+
+        display = df_inc.copy()
+        display.index = display.index.strftime("%Y年%m月期")
+        display = display / UNIT  # 百万円換算
+        available_cols = [c for c in METRICS if c in display.columns]
+        st.dataframe(
+            display[available_cols].style.format("{:,.0f}", na_rep="N/A"),
+            use_container_width=True,
+        )
+        st.caption("単位: 百万円")
+
+    st.divider()
+
+    # ── 指標別・複数社比較グラフ ──
+    st.subheader("指標別グラフ（複数社比較）")
+
+    for metric in METRICS:
+        series_list = []
+        for code, df_inc in income_histories.items():
+            if df_inc.empty or metric not in df_inc.columns:
+                continue
+            name = companies_data[code]["stock_info"].get("company_name", code)
+            s = (df_inc[metric] / UNIT).rename(f"{name}（{code}）")
+            series_list.append(s)
+
+        if not series_list:
+            continue
+
+        plot_df = pd.concat(series_list, axis=1)
+        plot_df.index = plot_df.index.strftime("%Y年%m月期")
+
+        fig = go.Figure()
+        for col in plot_df.columns:
+            fig.add_trace(go.Bar(
+                name=col,
+                x=plot_df.index,
+                y=plot_df[col],
+                text=plot_df[col].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else ""),
+                textposition="outside",
+            ))
+        fig.update_layout(
+            title=f"{metric}の推移（百万円）",
+            xaxis_title="会計年度",
+            yaxis_title="金額（百万円）",
+            barmode="group",
+            legend_title="銘柄",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        download_png_button(fig, f"trend_{metric}.png", f"dl_trend_{metric}")
+
+    # ── 売上成長率の折れ線グラフ ──
+    st.subheader("売上成長率の推移（前期比）")
+    growth_series = []
+    for code, df_inc in income_histories.items():
+        if df_inc.empty or "売上高" not in df_inc.columns:
+            continue
+        name = companies_data[code]["stock_info"].get("company_name", code)
+        growth = df_inc["売上高"].pct_change() * 100
+        growth.index = df_inc.index.strftime("%Y年%m月期")
+        growth_series.append(growth.rename(f"{name}（{code}）"))
+
+    if growth_series:
+        growth_df = pd.concat(growth_series, axis=1).dropna(how="all")
+        fig_growth = go.Figure()
+        for col in growth_df.columns:
+            fig_growth.add_trace(go.Scatter(
+                x=growth_df.index, y=growth_df[col],
+                mode="lines+markers+text",
+                name=col,
+                text=growth_df[col].apply(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
+                textposition="top center",
+            ))
+        fig_growth.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_growth.update_layout(
+            title="売上成長率（前期比 %）",
+            xaxis_title="会計年度",
+            yaxis_title="成長率（%）",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_growth, use_container_width=True)
+        download_png_button(fig_growth, "sales_growth.png", "dl_growth")
+
+    # ── 利益率の折れ線グラフ ──
+    st.divider()
+    st.subheader("利益率の推移")
+
+    MARGIN_METRICS = [
+        ("営業利益",              "営業利益率（%）"),
+        ("税引前利益(経常利益近似)", "経常利益率（%）"),
+        ("当期純利益",             "純利益率（%）"),
+    ]
+
+    col_left, col_right = st.columns(2)
+    margin_figs = []
+
+    for i, (profit_col, margin_label) in enumerate(MARGIN_METRICS):
+        margin_series = []
+        for code, df_inc in income_histories.items():
+            if df_inc.empty:
+                continue
+            if "売上高" not in df_inc.columns or profit_col not in df_inc.columns:
+                continue
+            name = companies_data[code]["stock_info"].get("company_name", code)
+            margin = (df_inc[profit_col] / df_inc["売上高"] * 100)
+            margin.index = df_inc.index.strftime("%Y年%m月期")
+            margin_series.append(margin.rename(f"{name}（{code}）"))
+
+        if not margin_series:
+            continue
+
+        margin_df = pd.concat(margin_series, axis=1).dropna(how="all")
+        fig_m = go.Figure()
+        for col in margin_df.columns:
+            fig_m.add_trace(go.Scatter(
+                x=margin_df.index,
+                y=margin_df[col],
+                mode="lines+markers+text",
+                name=col,
+                text=margin_df[col].apply(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
+                textposition="top center",
+            ))
+        fig_m.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_m.update_layout(
+            title=margin_label + "の推移",
+            xaxis_title="会計年度",
+            yaxis_title=margin_label,
+            hovermode="x unified",
+            legend_title="銘柄",
+        )
+        margin_figs.append((fig_m, margin_label))
+
+    # 2列レイアウトで表示
+    for i, (fig_m, margin_label) in enumerate(margin_figs):
+        safe_key = margin_label.replace("（", "_").replace("）", "_").replace("%", "pct")
+        if i % 2 == 0:
+            col_left, col_right = st.columns(2)
+        target_col = col_left if i % 2 == 0 else col_right
+        with target_col:
+            st.plotly_chart(fig_m, use_container_width=True)
+            download_png_button(fig_m, f"margin_{safe_key}.png", f"dl_margin_{safe_key}")
 
 # ========== 収益性タブ ==========
 with tab_profit:

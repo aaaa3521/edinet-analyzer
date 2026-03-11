@@ -84,6 +84,41 @@ def get_earnings_history(securities_code: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def get_income_history(securities_code: str) -> pd.DataFrame:
+    """
+    年次損益計算書の推移を取得する（最大4期分）
+    返り値: DataFrame
+        index   = 会計年度（datetime）
+        columns = [売上高, 営業利益, 税引前利益, 当期純利益]
+    経常利益はYahoo Financeに存在しないため税引前利益（Pretax Income）で近似する
+    """
+    t = _ticker(securities_code)
+    try:
+        df = t.income_stmt  # index=指標名, columns=決算日
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        ROW_MAP = {
+            "Total Revenue":    "売上高",
+            "Operating Income": "営業利益",
+            "Pretax Income":    "税引前利益(経常利益近似)",
+            "Net Income":       "当期純利益",
+        }
+        rows = {jp: df.loc[en] for en, jp in ROW_MAP.items() if en in df.index}
+        if not rows:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(rows).T          # index=指標名, columns=決算日
+        result = result.T                       # index=決算日, columns=指標名
+        result.index = pd.to_datetime(result.index).tz_localize(None)
+        result = result.sort_index()            # 古い順に並べ替え
+        result = result.apply(pd.to_numeric, errors="coerce")
+        return result
+
+    except Exception:
+        return pd.DataFrame()
+
+
 def get_multi_stock_info(securities_codes: list[str]) -> dict[str, dict]:
     """複数証券コードの株価情報を一括取得する"""
     return {code: get_stock_info(code) for code in securities_codes}
